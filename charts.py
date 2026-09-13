@@ -89,13 +89,15 @@ def drawdown_chart(series: dict[str, tuple[pd.Series, str]], height: int = 400) 
     return fig
 
 
-def annual_returns_chart(annual: dict[str, tuple[pd.Series, str]], height: int = 400) -> go.Figure:
+def annual_returns_chart(annual: dict[str, tuple[pd.Series, str]], height: int = 400,
+                         y_title: str = "Annual return", tickformat: str = "+.0%",
+                         hoverformat: str = "+.1%") -> go.Figure:
     fig = go.Figure()
     for label, (s, color) in annual.items():
         fig.add_trace(go.Bar(x=[str(y) for y in s.index], y=s.values, name=label, marker_color=color,
-                             hovertemplate="%{y:+.1%}<extra>%{fullData.name}</extra>"))
+                             hovertemplate="%{y:" + hoverformat + "}<extra>%{fullData.name}</extra>"))
     _layout(fig, height=height, barmode="group", bargap=0.28, bargroupgap=0.08)
-    fig.update_yaxes(tickformat="+.0%", title="Annual return")
+    fig.update_yaxes(tickformat=tickformat, title=y_title)
     fig.update_xaxes(type="category")
     return fig
 
@@ -192,4 +194,62 @@ def histogram(values: np.ndarray, x_title: str, markers: dict[str, tuple[float, 
         fig.update_xaxes(tickprefix=symbol or "", tickformat=",.0f", title=x_title)
     fig.update_yaxes(title="Number of portfolios")
     fig.update_layout(margin=dict(t=60))
+    return fig
+
+
+def money_bars_chart(annual: dict[str, tuple[pd.Series, str]], symbol: str, y_title: str,
+                     height: int = 380) -> go.Figure:
+    """Grouped bars of a money amount per year, e.g. dividend income."""
+    fig = go.Figure()
+    for label, (s, color) in annual.items():
+        fig.add_trace(go.Bar(x=[str(y) for y in s.index], y=s.values, name=label, marker_color=color,
+                             hovertemplate=_money_fmt(symbol) + "<extra>%{fullData.name}</extra>"))
+    _layout(fig, height=height, barmode="group", bargap=0.28, bargroupgap=0.08)
+    fig.update_yaxes(tickprefix=symbol, tickformat=",.0f", title=y_title)
+    fig.update_xaxes(type="category")
+    return fig
+
+
+def ratio_chart(series: dict[str, tuple[pd.Series, str]], y_title: str, height: int = 340,
+                reference: float | None = None) -> go.Figure:
+    """Lines of a multiple over time, e.g. leverage (2.0x)."""
+    fig = go.Figure()
+    for label, (s, color) in series.items():
+        fig.add_trace(go.Scatter(x=s.index, y=s.values, name=label, mode="lines", line=dict(color=color, width=2),
+                                 hovertemplate="%{y:.2f}x<extra>%{fullData.name}</extra>"))
+    if reference is not None:
+        fig.add_hline(y=reference, line=dict(color=MUTED, width=1, dash="dot"))
+    _layout(fig, height=height)
+    fig.update_yaxes(ticksuffix="x", tickformat=".1f", title=y_title, rangemode="tozero")
+    return fig
+
+
+def equity_with_calls_chart(series: dict[str, tuple[pd.Series, str]], calls: pd.DataFrame, symbol: str,
+                            log: bool = False, height: int = 430) -> go.Figure:
+    """Equity curves with margin calls (red) and wipe-outs (black) marked on the first series."""
+    fig = growth_chart(series, symbol, log=log, height=height)
+    if calls is not None and len(calls):
+        first = next(iter(series.values()))[0]
+        for kind, color, sym in (("margin call", BAD, "x"), ("wiped out", "#0b0b0b", "x-open")):
+            c = calls[calls["Type"] == kind]
+            if c.empty:
+                continue
+            y = first.reindex(pd.to_datetime(c["Date"])).to_numpy()
+            fig.add_trace(go.Scatter(x=pd.to_datetime(c["Date"]), y=y, name=f"{kind.capitalize()} ✕", mode="markers",
+                                     marker=dict(symbol=sym, size=12, color=color, line=dict(color=color, width=2)),
+                                     customdata=np.c_[c["Sold"].to_numpy(), c["Leverage before"].to_numpy()],
+                                     hovertemplate=(f"{kind} on %{{x|%Y-%m-%d}}<br>sold {symbol}%{{customdata[0]:,.0f}} "
+                                                    "at %{customdata[1]:.2f}x<extra></extra>")))
+    return fig
+
+
+def money_lines_chart(series: dict[str, tuple[pd.Series, str]], symbol: str, y_title: str,
+                      height: int = 380) -> go.Figure:
+    """Lines of a money amount over time, e.g. cumulative dividends."""
+    fig = go.Figure()
+    for label, (s, color) in series.items():
+        fig.add_trace(go.Scatter(x=s.index, y=s.values, name=label, mode="lines", line=dict(color=color, width=2),
+                                 hovertemplate=_money_fmt(symbol) + "<extra>%{fullData.name}</extra>"))
+    _layout(fig, height=height)
+    fig.update_yaxes(tickprefix=symbol, tickformat=",.0f", title=y_title)
     return fig

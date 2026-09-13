@@ -24,7 +24,7 @@ import time
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
@@ -46,6 +46,8 @@ SP500_SECTORS_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-comp
 NASDAQ100_URL = "https://api.nasdaq.com/api/quote/list-type/nasdaq100"
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_FRAMES_URL = "https://data.sec.gov/api/xbrl/frames/{taxonomy}/{tag}/shares/{period}.json"
+BLS_URL = "https://api.bls.gov/publicAPI/v2/timeseries/data/"            # US CPI-U, series CUUR0000SA0
+ONS_CPI_URL = "https://www.ons.gov.uk/economy/inflationandpriceindices/timeseries/d7bt/mm23/data"  # UK CPI
 
 PRICE_HISTORY_START = "1990-01-01"
 SEC_FIRST_YEAR = 2009             # XBRL filings start here
@@ -502,6 +504,42 @@ class FreeDataProvider(DataProvider):
         mcap = close_usd * shares
         return mcap, source, warns
 
+    # ---- consumer prices (for inflation adjustment) ------------------------------------------
+    def get_cpi(self, currency: str) -> tuple[pd.Series, str]:
+        """Monthly consumer price index: US CPI-U from the BLS for dollars, UK CPI from the ONS for pounds."""
+        if currency == "USD":
+            path = CACHE_DIR / "cpi_us.json"
+            if not (path.exists() and time.time() - path.stat().st_mtime < 30 * 86400):
+                rows = []
+                try:
+                    this_year = date.today().year
+                    for start in range(1995, this_year + 1, 10):
+                        r = requests.post(BLS_URL, json={"seriesid": ["CUUR0000SA0"], "startyear": str(start),
+                                                         "endyear": str(min(start + 9, this_year))},
+                                          headers={"Content-Type": "application/json"}, timeout=60)
+                        r.raise_for_status()
+                        j = r.json()
+                        if j.get("status") != "REQUEST_SUCCEEDED":
+                            raise RuntimeError(f"BLS API: {j.get('message')}")
+                        for d in j["Results"]["series"][0]["data"]:
+                            if d["period"].startswith("M") and d["period"] != "M13":
+                                try:
+                                    rows.append((f"{d['year']}-{d['period'][1:]}-01", float(d["value"])))
+                                except (TypeError, ValueError):
+                                    continue   # not yet published
+                    path.write_text(json.dumps(rows))
+                except Exception as exc:
+                    if not path.exists():
+                        raise RuntimeError(f"US CPI download failed: {exc}") from exc
+            rows = json.loads(path.read_text())
+            s = pd.Series({pd.Timestamp(d): v for d, v in rows}).sort_index()
+            return s, "US CPI-U, BLS"
+        raw = _fetch(ONS_CPI_URL, "cpi_uk.json", ttl_days=30,
+                     headers={"User-Agent": BROWSER_UA, "Accept": "application/json"})
+        months = json.loads(raw)["months"]
+        s = pd.Series({pd.Timestamp(datetime.strptime(m["date"], "%Y %b")): float(m["value"]) for m in months})
+        return s.sort_index(), "UK CPI, ONS"
+
     # ---- FX & benchmark -----------------------------------------------------------------
     def get_fx(self, pair: str = FX_TICKER) -> pd.Series:
         return self.get_prices([pair]).close[pair].dropna()
@@ -524,6 +562,7 @@ class MarketData:
     close: np.ndarray               # D x T split-adjusted close in `currency`, forward-filled
     mcap: np.ndarray                # D x T market cap in USD (NaN when the stock has no price that day)
     member: np.ndarray              # D x T bool: point-in-time universe membership
+    div_yield: np.ndarray           # D x T: cash dividend paid that day as a fraction of the previous close
     benchmark: pd.Series            # index total-return series in `currency`
     benchmark_label: str
     warnings: list[str]
@@ -531,18 +570,35 @@ class MarketData:
     shares_source: pd.Series
     prices_as_of: str
     point_in_time: bool
-    fx: pd.Series | None = None
+    fx: pd.Series | None = None     # GBP per USD conversion rate used on each day (None for USD)
+    fx_mode: str | None = None      # "actual" (daily rates), "fixed" (one rate all period) or None
+    cpi: pd.Series | None = None    # consumer price index aligned to the calendar (for inflation adjustment)
+    cpi_label: str | None = None
 
     @property
     def symbol(self) -> str:
         return "£" if self.currency == "GBP" else "$"
 
+    @property
+    def currency_label(self) -> str:
+        if self.currency == "GBP":
+            return "GBP at a fixed exchange rate" if self.fx_mode == "fixed" else "GBP at actual exchange rates"
+        return "USD"
+
     def index_of(self, when) -> int:
         return int(self.dates.searchsorted(pd.Timestamp(when)))
 
 
-def build_market_data(provider: DataProvider, universe: str, start, end, currency: str = "GBP",
+def build_market_data(provider: DataProvider, universe: str, start, end, currency: str = "GBP_FIXED",
                       custom_tickers: list[str] | None = None, progress=None) -> MarketData:
+    """Load and align everything the engine needs.
+
+    currency:  "USD"       prices as quoted (the stocks' own returns)
+               "GBP_FIXED" pounds at one exchange rate for the whole period: same percentage
+                           returns as USD, just a different unit (like a currency-hedged fund)
+               "GBP"       pounds at each day's real GBP/USD rate, so exchange-rate moves are
+                           part of the result (what an unhedged UK investor experienced)
+    """
     start, end = pd.Timestamp(start), pd.Timestamp(end)
     warm_start = start - pd.Timedelta(days=WARMUP_DAYS)
     warns: list[str] = []
@@ -580,18 +636,41 @@ def build_market_data(provider: DataProvider, universe: str, start, end, currenc
     warns += mc_warns
 
     adj_f, close_f = adj.ffill(), close.ffill()
+    # Cash dividends as a fraction of the previous close, recovered from the gap between the
+    # total-return series and the split-only series (both move identically on split days).
+    ratio = (close_f / close_f.shift(1)) / (adj_f / adj_f.shift(1))
+    dy = (1.0 - ratio).clip(lower=0.0, upper=0.5)
+    dy = dy.where(dy > 1e-5, 0.0).fillna(0.0)
     fx = None
-    if currency == "GBP":
+    fx_mode = None
+    if currency in ("GBP", "GBP_FIXED"):
         rate = provider.get_fx(FX_TICKER).reindex(calendar).ffill()
         if rate.isna().any():
             first = rate.first_valid_index()
-            warns.append(f"GBP/USD exchange rates start {first.date()}; earlier dates use that first rate.")
+            if currency == "GBP":
+                warns.append(f"GBP/USD exchange rates start {first.date()}; earlier dates use that first rate.")
             rate = rate.bfill()
+        if currency == "GBP_FIXED":
+            # one rate for the whole period: pounds as the unit, but no exchange-rate effect at all
+            at_start = rate.iloc[min(int(calendar.searchsorted(start)), len(rate) - 1)]
+            rate = pd.Series(float(at_start), index=calendar)
+            fx_mode = "fixed"
+        else:
+            fx_mode = "actual"
         adj_f, close_f = adj_f.div(rate, axis=0), close_f.div(rate, axis=0)
         bench = bench.reindex(calendar).ffill().div(rate)
         fx = rate
+        currency = "GBP"
     else:
         bench = bench.reindex(calendar).ffill()
+
+    # consumer prices for the optional inflation adjustment (US CPI for dollars, UK CPI for pounds)
+    cpi, cpi_label = None, None
+    try:
+        s, cpi_label = provider.get_cpi(currency)
+        cpi = s.reindex(s.index.union(calendar)).ffill().reindex(calendar).bfill()
+    except Exception as exc:
+        warns.append(f"Inflation data unavailable ({exc}); the inflation adjustment is switched off.")
 
     # point-in-time membership matrix
     member = np.zeros((len(calendar), len(ok)), dtype=bool)
@@ -621,8 +700,10 @@ def build_market_data(provider: DataProvider, universe: str, start, end, currenc
     return MarketData(universe=universe, currency=currency, dates=calendar, tickers=ok,
                       adj=adj_f.to_numpy(dtype="float64"), close=close_f.to_numpy(dtype="float64"),
                       mcap=mcap.to_numpy(dtype="float64"), member=member,
+                      div_yield=dy.to_numpy(dtype="float32"),
                       benchmark=bench, benchmark_label=bench_label, warnings=warns, coverage=coverage,
-                      shares_source=source, prices_as_of=prices.as_of, point_in_time=hist.point_in_time, fx=fx)
+                      shares_source=source, prices_as_of=prices.as_of, point_in_time=hist.point_in_time,
+                      fx=fx, fx_mode=fx_mode, cpi=cpi, cpi_label=cpi_label)
 
 
 def benchmark_values(provider: DataProvider, md: MarketData, ticker: str, index: pd.DatetimeIndex,
